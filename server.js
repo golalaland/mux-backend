@@ -7,32 +7,99 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Correct way for latest SDK (v8+)
-const mux = new Mux({
+// Validate env vars
+if (!process.env.MUX_TOKEN_ID || !process.env.MUX_TOKEN_SECRET) {
+  console.error("ERROR: Mux credentials are missing!");
+  process.exit(1);
+}
+
+console.log("MUX_TOKEN_ID:", process.env.MUX_TOKEN_ID ? "LOADED" : "MISSING");
+console.log("MUX_TOKEN_SECRET:", process.env.MUX_TOKEN_SECRET ? "LOADED" : "MISSING");
+
+// Initialize Mux SDK
+const { Video } = new Mux({
   tokenId: process.env.MUX_TOKEN_ID,
   tokenSecret: process.env.MUX_TOKEN_SECRET,
 });
 
-// Create live stream endpoint
-app.post('/create-live-stream', async (req, res) => {
+// Helper: Get or create ONE permanent live stream
+let permanentStream;
+async function initPermanentStream() {
+  let liveStreamId = process.env.MUX_LIVE_STREAM_ID;
+
+  if (liveStreamId) {
+    try {
+      const existing = await Video.LiveStreams.retrieve(liveStreamId);
+      console.log(`Reusing existing stream (ID: ${liveStreamId}, status: ${existing.status})`);
+      permanentStream = existing;
+      return;
+    } catch (err) {
+      console.warn(`Stream ID ${liveStreamId} invalid/not found → creating new one`);
+    }
+  }
+
+  // Create new (happens only once)
+  console.log("Creating NEW permanent live stream...");
+  const newStream = await Video.LiveStreams.create({
+    playback_policy: 'public',
+    new_asset_settings: { playback_policy: ['public'] },
+    latency_mode: 'low',
+    reconnect_window: 60,
+  });
+
+  console.log("\n===== IMPORTANT - COPY THESE VALUES =====");
+  console.log("Live Stream ID:", newStream.id);
+  console.log("Playback ID:", newStream.playback_ids[0]?.id);
+  console.log("Stream Key:", newStream.stream_key);
+  console.log("RTMP URL:", newStream.rtmp?.url || 'rtmps://global-live.mux.com:443/app');
+  console.log("=========================================\n");
+
+  permanentStream = newStream;
+}
+
+// Run init on startup
+initPermanentStream().catch(err => {
+  console.error("Failed to init permanent stream:", err);
+});
+
+// Routes
+app.get('/api/mux-live-status', async (req, res) => {
+  const { type = 'regular' } = req.query;
+
+  if (!permanentStream) {
+    return res.status(503).json({ error: 'Stream initializing... try again in 10s' });
+  }
+
   try {
-    const liveStream = await mux.video.liveStreams.create({
-      playback_policy: ['public'],
-      new_asset_settings: { playback_policy: ['public'] },
-      latency_mode: 'low', // or 'standard' or 'reduced'
-      reconnect_window: 60,
+    const latest = await Video.LiveStreams.retrieve(permanentStream.id);
+    res.json({
+      isActive: latest.status === 'active',
+      status: latest.status,
+      playbackId: latest.playback_ids[0]?.id
     });
-
-    const playbackId = liveStream.playback_ids[0].id;
-
-    res.json({ playbackId });
-  } catch (error) {
-    console.error('Mux error:', error);
-    res.status(500).json({ error: 'Failed to create stream', details: error.message });
+  } catch (err) {
+    console.error("Status error:", err);
+    res.status(500).json({ error: 'Failed to check status' });
   }
 });
 
+// Debug info (optional)
+app.get('/stream-info', (req, res) => {
+  if (!permanentStream) return res.status(503).json({ error: 'Not ready' });
+  res.json({
+    liveStreamId: permanentStream.id,
+    playbackId: permanentStream.playback_ids[0]?.id,
+    status: permanentStream.status
+  });
+});
+
+// Your old route (keep it for now if needed)
+app.post('/create-live-stream', async (req, res) => {
+  // ... your original code here ...
+});
+
+// Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Mux backend server running on http://localhost:${PORT}`);
+  console.log(`Mux backend running on port ${PORT}`);
 });
